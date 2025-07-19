@@ -9,6 +9,7 @@ from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
 
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 from itertools import combinations
 
@@ -629,8 +630,9 @@ class DataFramePreprocessor(BaseEstimator, TransformerMixin):
         if self.encoding == 'onehot' and input_features is not None:
             return self.transform(input_features).columns.tolist()
         return input_features or []
-
-    def dataset_overview(self, X, corr_threshold=None):
+    
+    @staticmethod
+    def dataset_overview(X, corr_threshold=None):
         """
         Generate summary statistics for a DataFrame:
           - variance of numeric columns
@@ -673,6 +675,57 @@ class DataFramePreprocessor(BaseEstimator, TransformerMixin):
         for col, le in self.label_encoders_.items():
             mapping[col] = {i: label for i, label in enumerate(le.classes_)}
         return mapping
+
+class CollinearityRemover(BaseEstimator, TransformerMixin):
+    def __init__(self, threshold=10.0, verbose=False):
+        self.threshold = threshold
+        self.verbose = verbose
+        self.features_to_keep = []
+        self.features_removed = []
+        self.vif_trace_ = {}
+        self.trace_ = {}
+
+    def fit(self, X, y=None):
+        if isinstance(X, np.ndarray):
+            X = pd.DataFrame(X)
+
+        X = X.copy()
+        self.features_to_keep = X.columns.tolist()
+        self.features_removed = []
+        self.vif_trace_ = {}
+
+        iteration = 0
+        while True:
+            vif_data = pd.Series(
+                [variance_inflation_factor(X.values, i) for i in range(X.shape[1])],
+                index=X.columns
+            )
+            self.vif_trace_[f"step_{iteration}"] = vif_data.to_dict()
+
+            max_vif = vif_data.max()
+            if max_vif > self.threshold:
+                feature_to_drop = vif_data.idxmax()
+                if self.verbose:
+                    print(f"[VIF {iteration}] Drop: {feature_to_drop} (VIF={max_vif:.2f})")
+                self.features_removed.append((feature_to_drop, max_vif))
+                X = X.drop(columns=[feature_to_drop])
+                iteration += 1
+            else:
+                break
+
+        self.features_to_keep = X.columns.tolist()
+        self.trace_ = {
+            "threshold": self.threshold,
+            "features_removed": self.features_removed,
+            "final_features": self.features_to_keep,
+            "vif_trace": self.vif_trace_
+        }
+        return self
+
+    def transform(self, X):
+        if isinstance(X, np.ndarray):
+            X = pd.DataFrame(X)
+        return X[self.features_to_keep]
 
 
 #----------------------------------------------------
