@@ -7,11 +7,10 @@ from typing import List, Tuple, Dict, Optional, Type, Union
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder, OrdinalEncoder
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
+
+
+from itertools import combinations
 
 import plotly.graph_objects as go
 import plotly.express as px
@@ -310,76 +309,6 @@ class VisualizerFactory:
         fig.update_layout(title=title, xaxis_title="t-SNE 1", yaxis_title="t-SNE 2")
         return fig
 
-class DataCleaner(BaseEstimator, TransformerMixin):
-    """
-    Cleans and preprocesses data, handling missing values, scaling, encoding, and duplicate removal.
-    """
-    def __init__(
-        self,
-        numeric_strategy='mean',
-        categorical_strategy='most_frequent',
-        scale_numeric=True,
-        drop_duplicates=False
-    ):
-        """
-        Initializes the data cleaner with strategies for numeric and categorical features.
-        """
-        self.numeric_strategy = numeric_strategy
-        self.categorical_strategy = categorical_strategy
-        self.scale_numeric = scale_numeric
-        self.drop_duplicates = drop_duplicates
-
-    def fit(self, X, y=None):
-        """
-        Fits the cleaning pipeline to the data, learning feature types and transformations.
-        """
-        X = pd.DataFrame(X)
-        self.numeric_features_ = X.select_dtypes(include=['number']).columns.tolist()
-        self.categorical_features_ = X.select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
-        
-        if self.numeric_strategy == "drop" or self.categorical_strategy == "drop":
-            self.pipeline_ = None
-            return self
-        
-        transformers = []
-        if self.numeric_features_:
-            numeric_pipeline = Pipeline([
-                ('imputer', SimpleImputer(strategy=self.numeric_strategy)),
-                ('scaler', StandardScaler() if self.scale_numeric else 'passthrough')
-            ])
-            transformers.append(('num', numeric_pipeline, self.numeric_features_))
-        if self.categorical_features_:
-            categorical_pipeline = Pipeline([
-                ('imputer', SimpleImputer(strategy=self.categorical_strategy)),
-                ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
-            ])
-            transformers.append(('cat', categorical_pipeline, self.categorical_features_))
-        self.pipeline_ = ColumnTransformer(transformers, remainder='drop')
-        self.pipeline_.fit(X)
-        return self
-
-    def transform(self, X):
-        """
-        Transforms the data using the fitted cleaning pipeline.
-        """
-        X = pd.DataFrame(X)
-        # Drop rows with NaNs if drop strategy is used
-        if self.numeric_strategy == "drop" or self.categorical_strategy == "drop":
-            X = X.dropna()
-            return X.reset_index(drop=True)
-        
-        arr = self.pipeline_.transform(X)
-        feature_names = []
-        feature_names += self.numeric_features_
-        if self.categorical_features_:
-            try:
-                enc = self.pipeline_.named_transformers_['cat'].named_steps['encoder']
-                cats = enc.get_feature_names_out(self.categorical_features_)
-                feature_names += cats.tolist()
-            except Exception:
-                pass
-        return pd.DataFrame(arr, columns=feature_names, index=X.index)
-
 class FeatureEngineeringSelector(BaseEstimator, TransformerMixin):
     """
     Generic feature engineering/selection pipeline supporting model-based selection, PCA, and custom strategies.
@@ -387,9 +316,14 @@ class FeatureEngineeringSelector(BaseEstimator, TransformerMixin):
     def __init__(self, strategies=None, problem_type='auto', random_state=42):
         """
         Initializes the feature engineering selector with strategies and problem type.
+        strategies: list of dicts, each with keys:
+            - name: "model_importance", "pca", or "custom"
+            - other keys depending on strategy
+        problem_type: 'regression', 'classification', or 'auto'
+        random_state: random seed
         """
         self.strategies = strategies or []
-        self.problem_type = problem_type  # 'regression', 'classification', or 'auto'
+        self.problem_type = problem_type
         self.random_state = random_state
 
     def fit(self, X, y=None):
@@ -397,17 +331,21 @@ class FeatureEngineeringSelector(BaseEstimator, TransformerMixin):
         Fits the feature engineering/selection pipeline according to the specified strategies.
         """
         X = pd.DataFrame(X)
-        self.features_ = X.columns.tolist()
-        X_curr = X.copy()
-        self.history_ = []
         y_series = pd.Series(y) if y is not None else None
 
+        # To store history and fitted parameters for transform
+        self.history_ = []
+        self.fitted_strategies_ = []
+
+        X_curr = X.copy()
         for strat in self.strategies:
             name = strat.get("name")
+
             if name == "model_importance":
                 model_cls = strat.get("model_cls", RandomForestRegressor)
                 model = model_cls(random_state=self.random_state)
                 model.fit(X_curr, y_series)
+
                 importances = np.array(model.feature_importances_)
                 threshold = strat.get("threshold", "mean")
                 if threshold == "mean":
@@ -418,31 +356,49 @@ class FeatureEngineeringSelector(BaseEstimator, TransformerMixin):
                     thresh_val = threshold
                 else:
                     thresh_val = 0.0
-                support = importances > thresh_val
-                selected = X_curr.columns[support].tolist()
+
+                selected = X_curr.columns[importances > thresh_val].tolist()
                 X_curr = X_curr[selected]
+
+                # Record history and fitted parameters
                 self.history_.append({
                     "step": "model_importance",
                     "selected": selected,
                     "importances": importances.tolist(),
-                    "columns": X_curr.columns.tolist()
                 })
+                self.fitted_strategies_.append(("model_importance", {"selected": selected}))
+
             elif name == "pca":
                 n_components = strat.get("n_components", 2)
                 pca = PCA(n_components=n_components, random_state=self.random_state)
-                X_pca = pca.fit_transform(X_curr)
+                pca.fit(X_curr)
+
+                X_pca = pca.transform(X_curr)
                 cols = [f'pca_{i}' for i in range(X_pca.shape[1])]
                 X_curr = pd.DataFrame(X_pca, columns=cols, index=X_curr.index)
+
+                # Record history and fitted PCA
                 self.history_.append({
                     "step": "pca",
-                    "columns": X_curr.columns.tolist(),
+                    "columns": cols,
                     "explained_variance": pca.explained_variance_ratio_.tolist()
                 })
+                self.fitted_strategies_.append(("pca", {"pca": pca}))
+
             elif name == "custom":
                 func = strat.get("func")
                 X_curr = func(X_curr, y_series)
-                self.history_.append({"step": "custom", "columns": X_curr.columns.tolist()})
-            # Add other strategies here
+
+                self.history_.append({
+                    "step": "custom",
+                    "columns": X_curr.columns.tolist()
+                })
+                self.fitted_strategies_.append(("custom", {"func": func}))
+
+            else:
+                raise ValueError(f"Unknown strategy name: {name}")
+
+        # Final selected features and shape
         self.selected_features_ = X_curr.columns.tolist()
         self.X_shape_ = X_curr.shape
         return self
@@ -451,12 +407,27 @@ class FeatureEngineeringSelector(BaseEstimator, TransformerMixin):
         """
         Transforms the data using the fitted feature engineering/selection pipeline.
         """
-        X = pd.DataFrame(X)
-        if hasattr(self, "selected_features_"):
-            cols = [c for c in self.selected_features_ if c in X.columns]
-            return X[cols]
-        else:
-            return X
+        X_curr = pd.DataFrame(X)
+        for name, params in getattr(self, 'fitted_strategies_', []):
+            if name == "model_importance":
+                selected = params.get("selected", [])
+                X_curr = X_curr[selected]
+
+            elif name == "pca":
+                pca = params.get("pca")
+                X_pca = pca.transform(X_curr)
+                cols = [f'pca_{i}' for i in range(X_pca.shape[1])]
+                X_curr = pd.DataFrame(X_pca, columns=cols, index=X_curr.index)
+
+            elif name == "custom":
+                func = params.get("func")
+                X_curr = func(X_curr, None)
+
+            else:
+                # In case of unknown strategy
+                continue
+
+        return X_curr
 
     def get_support(self):
         """
@@ -502,125 +473,206 @@ class TargetLabelEncoder(BaseEstimator, TransformerMixin):
         """
         return self._le.inverse_transform(y)
 
-
-
-
-class MetaCleanPipeline:
+class DataFramePreprocessor(BaseEstimator, TransformerMixin):
     """
-    Pipeline for cleaning, feature engineering, and target encoding.
+    scikit-learn compatible transformer for preprocessing a pandas DataFrame:
+      - convert boolean columns to integers
+      - convert object columns to categorical dtype
+      - encode categorical features (label or one-hot)
+      - handle missing values (drop, fill, or none)
+      - normalize numeric features (standard or min-max)
+      - provide inverse_transform for label encoding and normalization
+      - generate dataset overview statistics and track colinearity
     """
-    def __init__(
-        self,
-        feature_engineering_strategies=None,
-        drop_duplicates=True,
-        target_encoder_method='label',  # 'label', 'ordinal', 'onehot', or a custom encoder class
-        target_encoder_kwargs=None,
-        auto_encode_features=True,
-        **cleaner_kwargs
-    ):
-        self.cleaner = DataCleaner(drop_duplicates=drop_duplicates, **cleaner_kwargs)
-        self.feat_eng = FeatureEngineeringSelector(strategies=feature_engineering_strategies) if feature_engineering_strategies else None
-        self.drop_duplicates = drop_duplicates
+    def __init__(self,
+                 fill_strategy='drop',    # 'drop', 'fill', or 'none'
+                 fill_method=None,        # 'mean', 'median', 'mode', or None
+                 fill_value=None,         # constant fill value if fill_method is None
+                 group_by=None,           # column name(s) for group-wise imputation
+                 encoding='label',        # 'label' or 'onehot'
+                 normalization=None,      # None, 'standard', or 'minmax'
+                 normalization_range=(0,1), # tuple (min, max) for minmax scaler
+                 corr_threshold=0.8       # threshold for detecting colinearity
+                ):
+        self.fill_strategy = fill_strategy
+        self.fill_method = fill_method
+        self.fill_value = fill_value
+        self.group_by = group_by
+        self.encoding = encoding
+        self.normalization = normalization
+        self.normalization_range = normalization_range
+        self.corr_threshold = corr_threshold
 
-        encoder_methods = {
-            'label': LabelEncoder,
-            'ordinal': OrdinalEncoder,
-            'onehot': OneHotEncoder
-        }
-        
-        self.target_encoder_kwargs = target_encoder_kwargs or {}
-        if callable(target_encoder_method):
-            self.target_encoder = target_encoder_method(**self.target_encoder_kwargs)
-        else:
-            encoder_cls = encoder_methods.get(target_encoder_method.lower(), LabelEncoder)
-            self.target_encoder = encoder_cls(**self.target_encoder_kwargs)
+        # Attributes to be set during fit
+        self.bool_cols_ = []
+        self.obj_cols_ = []
+        self.cat_cols_ = []
+        self.num_cols_ = []
+        self.label_encoders_ = {}
+        self.fill_values_ = {}
+        self.scaler_ = None
 
-        self.auto_encode_features = auto_encode_features
+    def fit(self, X, y=None):
+        df = X.copy()
+        # Identify columns by dtype
+        self.bool_cols_ = df.select_dtypes(include=['bool']).columns.tolist()
+        self.obj_cols_ = df.select_dtypes(include=['object']).columns.tolist()
+        cat_cols = df.select_dtypes(include=['category']).columns.tolist()
+        self.cat_cols_ = self.obj_cols_ + cat_cols
+        self.num_cols_ = df.select_dtypes(include='number').columns.tolist()
 
-    def fit(self, X, y):
-        df = pd.DataFrame(X).copy()
-        y = pd.Series(y).reset_index(drop=True)
-        df['__target__'] = y
-        
-        if self.drop_duplicates:
-            df = df.drop_duplicates().reset_index(drop=True)
+        # Convert object columns to category dtype
+        for col in self.obj_cols_:
+            df[col] = df[col].astype('category')
 
-        y_clean = df.pop('__target__')
-        X_clean = df
+        # Prepare imputation values if needed
+        if self.fill_strategy == 'fill':
+            if self.group_by:
+                grouped = df.groupby(self.group_by)
+                for col in df.columns:
+                    if col in (self.group_by or []):
+                        continue
+                    if self.fill_method:
+                        if self.fill_method in ('mean', 'median'):
+                            self.fill_values_[col] = grouped[col].transform(self.fill_method)
+                        else:
+                            modes = grouped[col].apply(lambda grp: grp.mode().iloc[0] if not grp.mode().empty else None)
+                            self.fill_values_[col] = df[self.group_by].apply(
+                                lambda row: modes[tuple(row)] if isinstance(row, (list, tuple)) else modes[row],
+                                axis=1
+                            )
+                    else:
+                        self.fill_values_[col] = self.fill_value
+            else:
+                if self.fill_method:
+                    if self.fill_method in ('mean', 'median'):
+                        for col in self.num_cols_:
+                            self.fill_values_[col] = getattr(df[col], self.fill_method)()
+                    else:
+                        mode_row = df.mode().iloc[0]
+                        for col in df.columns:
+                            self.fill_values_[col] = mode_row[col]
+                else:
+                    for col in df.columns:
+                        self.fill_values_[col] = self.fill_value
 
-        # Encode target
-        if hasattr(self.target_encoder, 'fit_transform'):
-            y_enc = self.target_encoder.fit_transform(y_clean.values.reshape(-1, 1) if isinstance(self.target_encoder, (OrdinalEncoder, OneHotEncoder)) else y_clean)
-        else:
-            self.target_encoder.fit(y_clean)
-            y_enc = self.target_encoder.transform(y_clean)
+        # Fit label encoders if needed
+        if self.encoding == 'label':
+            for col in self.cat_cols_:
+                le = LabelEncoder()
+                le.fit(df[col].astype(str))
+                self.label_encoders_[col] = le
 
-        self._y_clean = y_enc
-        self._X_clean = X_clean.copy()
-
-        # Encode categorical features
-        if self.auto_encode_features:
-            cat_features = X_clean.select_dtypes(include=['object', 'category']).columns
-            if cat_features.any():
-                X_clean[cat_features] = X_clean[cat_features].astype(str)
-                X_clean = pd.get_dummies(X_clean, columns=cat_features, drop_first=True)
-
-        # Cleaning
-        self.cleaner.fit(X_clean, y_enc)
-        X_trans = self.cleaner.transform(X_clean)
-
-        # Feature engineering
-        if self.feat_eng:
-            self.feat_eng.fit(X_trans, y_enc)
+        # Fit normalization scaler
+        if self.normalization:
+            if self.normalization == 'standard':
+                self.scaler_ = StandardScaler()
+            else:
+                self.scaler_ = MinMaxScaler(feature_range=self.normalization_range)
+            self.scaler_.fit(df[self.num_cols_])
 
         return self
 
     def transform(self, X):
-        X = pd.DataFrame(X).copy()
+        df = X.copy()
+        # Convert booleans to integers
+        for col in self.bool_cols_:
+            if col in df:
+                df[col] = df[col].astype(int)
+        # Convert object to category
+        for col in self.obj_cols_:
+            if col in df:
+                df[col] = df[col].astype('category')
 
-        if self.auto_encode_features:
-            cat_features = X.select_dtypes(include=['object', 'category']).columns
-            if cat_features.any():
-                X[cat_features] = X[cat_features].astype(str)
-                X = pd.get_dummies(X, columns=cat_features, drop_first=True)
+        # Handle missing values
+        if self.fill_strategy == 'drop':
+            df = df.dropna()
+        elif self.fill_strategy == 'fill':
+            for col, vals in self.fill_values_.items():
+                if col in df:
+                    df[col] = df[col].fillna(vals)
+        # else 'none': do nothing
 
-        X_cleaned = self.cleaner.transform(X)
+        # Encode categorical features
+        if self.encoding == 'label':
+            for col, le in self.label_encoders_.items():
+                if col in df:
+                    df[col] = le.transform(df[col].astype(str))
+        elif self.encoding == 'onehot':
+            df = pd.get_dummies(df, columns=self.cat_cols_, drop_first=False)
 
-        if self.feat_eng:
-            return self.feat_eng.transform(X_cleaned)
-        
-        return X_cleaned
+        # Normalize numeric features
+        if self.normalization and not df.empty:
+            df[self.num_cols_] = self.scaler_.transform(df[self.num_cols_])
 
-    def fit_transform(self, X, y):
-        self.fit(X, y)
-        return self.transform(self._X_clean)
+        return df
 
-    def transform_target(self, y):
-        if hasattr(self.target_encoder, 'transform'):
-            return self.target_encoder.transform(y.values.reshape(-1, 1) if isinstance(self.target_encoder, (OrdinalEncoder, OneHotEncoder)) else y)
-        else:
-            raise AttributeError("Target encoder does not support transform method.")
+    def inverse_transform(self, X):
+        df = X.copy()
+        # Reverse normalization first
+        if self.normalization and self.scaler_:
+            df[self.num_cols_] = self.scaler_.inverse_transform(df[self.num_cols_])
+        # Reverse label encoding
+        if self.encoding == 'label':
+            for col, le in self.label_encoders_.items():
+                if col in df:
+                    df[col] = le.inverse_transform(df[col].astype(int))
+        return df
 
-    def inverse_transform_target(self, y_enc):
-        if hasattr(self.target_encoder, 'inverse_transform'):
-            return self.target_encoder.inverse_transform(y_enc)
-        else:
-            raise AttributeError("Target encoder does not support inverse_transform method.")
+    def fit_transform(self, X, y=None):
+        return self.fit(X, y).transform(X)
 
-    def get_cleaned_dataset(self):
-        return self._X_clean.copy(), self._y_clean.copy()
+    def get_feature_names_out(self, input_features=None):
+        """
+        Return output feature names for one-hot encoding.
+        """
+        if self.encoding == 'onehot' and input_features is not None:
+            return self.transform(input_features).columns.tolist()
+        return input_features or []
 
-    def get_final_dataset(self):
-        return self.transform(self._X_clean)
+    def dataset_overview(self, X, corr_threshold=None):
+        """
+        Generate summary statistics for a DataFrame:
+          - variance of numeric columns
+          - count of unique values per column
+          - count of missing values per column
+          - data type of each column
+          - correlation matrix for numeric features
+          - list of colinear feature pairs above a threshold
+        """
+        df = X.copy()
+        # Basic stats
+        stats = pd.DataFrame({
+            'variance': df.var(numeric_only=True),
+            'unique_values': df.nunique(),
+            'nan_counts': df.isna().sum(),
+            'dtype': df.dtypes
+        })
+        # Correlation matrix
+        corr_matrix = df.select_dtypes(include=np.number).corr()
+        # Determine threshold
+        thresh = corr_threshold if corr_threshold is not None else self.corr_threshold
+        # Find colinear pairs
+        colinear_pairs = [
+            (col1, col2, corr_matrix.loc[col1, col2])
+            for col1, col2 in combinations(corr_matrix.columns, 2)
+            if abs(corr_matrix.loc[col1, col2]) >= thresh
+        ]
+        return {
+            'stats': stats,
+            'correlation_matrix': corr_matrix,
+            'colinear_pairs': colinear_pairs
+        }
 
-    def get_selected_features(self):
-        if self.feat_eng:
-            return self.feat_eng.get_support()
-        else:
-            return self.cleaner.numeric_features_ + self.cleaner.categorical_features_
-
-    def get_target_encoder(self):
-        return self.target_encoder
+    def get_label_mapping(self):
+        """
+        Returns a mapping for each label-encoded column:
+          { column_name: {encoded_value: original_label} }
+        """
+        mapping = {}
+        for col, le in self.label_encoders_.items():
+            mapping[col] = {i: label for i, label in enumerate(le.classes_)}
+        return mapping
 
 
 #----------------------------------------------------
